@@ -1,6 +1,7 @@
 /*!
 # XML 1.0 Lexer
 */
+use std::borrow::Borrow;
 // needed for trait bounds
 use std::convert::TryInto;
 use std::fmt;
@@ -379,6 +380,8 @@ pub struct LexerOptions {
 	/// split and emitted in parts (and lexing continues), all other tokens
 	/// exceeding this limit will cause an error.
 	pub max_token_length: usize,
+
+	pub lossy_utf8: bool,
 }
 
 impl LexerOptions {
@@ -402,6 +405,12 @@ impl LexerOptions {
 		self.max_token_length = v;
 		self
 	}
+
+	/// Set lossy-utf8
+	pub fn lossy_utf8(mut self, lossy: bool) -> LexerOptions {
+		self.lossy_utf8 = lossy;
+		self
+	}
 }
 
 impl Default for LexerOptions {
@@ -411,6 +420,7 @@ impl Default for LexerOptions {
 	fn default() -> Self {
 		Self {
 			max_token_length: 8192,
+			lossy_utf8: false,
 		}
 	}
 }
@@ -698,38 +708,75 @@ impl Lexer {
 	}
 
 	fn flush_scratchpad_as_name(&mut self) -> Result<Name> {
-		self.flush_scratchpad(|bytes| -> Result<Name> {
-			let s = match std::str::from_utf8(bytes) {
-				Ok(s) => Ok(s),
-				Err(e) => Err(Error::utf8err(bytes, &e)),
-			}?;
-			Ok(s.try_into()?)
-		})
+		if self.opts.lossy_utf8 {
+			self.flush_scratchpad(|bytes| -> Result<Name> {
+				let s = String::from_utf8_lossy(bytes);
+				Ok((&*s).try_into()?)
+			})
+		} else {
+			self.flush_scratchpad(|bytes| -> Result<Name> {
+				let s = match std::str::from_utf8(bytes) {
+					Ok(s) => Ok(s),
+					Err(e) => Err(Error::utf8err(bytes, &e)),
+				}?;
+				Ok(s.try_into()?)
+			})
+		}
 	}
 
 	fn flush_scratchpad_as_complete_cdata(&mut self) -> Result<CData> {
-		self.flush_scratchpad(|bytes| -> Result<CData> {
-			let s = match std::str::from_utf8(bytes) {
-				Ok(s) => Ok(s),
-				Err(e) => Err(Error::utf8err(bytes, &e)),
-			}?;
-			Ok(s.try_into()?)
-		})
+		if self.opts.lossy_utf8 {
+			self.flush_scratchpad(|bytes| -> Result<CData> {
+				let s = String::from_utf8_lossy(bytes);
+				Ok((&*s).try_into()?)
+			})
+		} else {
+			self.flush_scratchpad(|bytes| -> Result<CData> {
+				let s = match std::str::from_utf8(bytes) {
+					Ok(s) => Ok(s),
+					Err(e) => Err(Error::utf8err(bytes, &e)),
+				}?;
+				Ok(s.try_into()?)
+			})
+		}
 	}
 
 	fn flush_scratchpad_as_partial_cdata(&mut self) -> Result<CData> {
-		let s = match std::str::from_utf8(&self.scratchpad[..]) {
-			Ok(s) => s,
-			Err(e) => {
-				// TODO: this will need refinement...
-				let valid_up_to = e.valid_up_to();
-				if valid_up_to == 0 {
-					// this means that we actually and truly have a broken utf-8 sequence.
-					// return an error.
-					return Err(Error::InvalidUtf8Byte(self.scratchpad[0]));
-				} else {
-					// okay, we can return the stuff up to here and then let the next call deal with it
-					unsafe { std::str::from_utf8_unchecked(&self.scratchpad[..valid_up_to]) }
+		let s = loop {
+			match std::str::from_utf8(&self.scratchpad[..]) {
+				Ok(s) => break s,
+				Err(e) => {
+					// TODO: this will need refinement...
+					let valid_up_to = e.valid_up_to();
+					if valid_up_to == 0 {
+						// this means that we actually and truly have a broken utf-8 sequence.
+						// return an error.
+
+						fn valid_start_byte(b: u8) -> bool {
+							(b & 0b10000000 == 0) ||
+							(b & 0b11100000 == 0b11000000) ||
+							(b & 0b11110000 == 0b11100000) || 
+							(b & 0b11111000 == 0b11110000)
+						}
+
+						if self.opts.lossy_utf8 {
+							match self.scratchpad.iter().position(|&b| valid_start_byte(b)) {
+								Some(next_pos) => {
+									self.scratchpad.drain(..next_pos);
+								}
+								None => {
+									return Ok(CData::from_str("").unwrap());
+								}
+							}
+						} else {
+							let byte = self.scratchpad[0];
+
+							return Err(Error::InvalidUtf8Byte(byte));
+						}
+					} else {
+						// okay, we can return the stuff up to here and then let the next call deal with it
+						break unsafe { std::str::from_utf8_unchecked(&self.scratchpad[..valid_up_to]) };
+					}
 				}
 			}
 		};
